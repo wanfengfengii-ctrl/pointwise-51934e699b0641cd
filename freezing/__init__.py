@@ -1,0 +1,1 @@
+"""Immutable source day snapshots."""

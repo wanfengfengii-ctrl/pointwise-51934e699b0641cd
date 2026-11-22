@@ -1,0 +1,1 @@
+"""Source station batch intake."""

@@ -1,0 +1,13 @@
+{
+  "day": "2026-07-14",
+  "batch_id": "B-20",
+  "station": "S1",
+  "rows": [
+    {"unit": "L", "litres": 7, "source": {"document": "station.csv", "line": 2}},
+    {"unit": "L", "litres": null, "source": {"document": "station.csv", "line": 3}},
+    {"unit": "L", "litres": 13, "source": {"document": "station.csv", "line": 4}}
+  ],
+  "corrections": {"C": 5, "D": 4},
+  "withdrawal": {"id": "R", "target": "C"},
+  "deliveries": {"v5": ["R", "D", "C"], "v6": ["C", "D", "R"]}
+}
