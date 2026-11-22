@@ -6,6 +6,7 @@ from intake.provenance import require_fields, require_name
 from intake.rows import litres_text, require_integer, text_litres
 
 WIRE_VERSION = 1
+OFFSET_WIRE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,12 @@ class Package:
     station: str | None = None
     delta: int | None = None
     target_id: str | None = None
+    stations: tuple[str, ...] | None = None
+    litres: int | None = None
+
+    @property
+    def version(self):
+        return OFFSET_WIRE_VERSION if self.kind == 'offset' else WIRE_VERSION
 
 
 def require_operation_id(value):
@@ -47,6 +54,31 @@ def make_correction_package(package_id, day_id, station, delta):
     )
 
 
+def _require_offset_id(value):
+    return require_operation_id(value)
+
+
+def _normalize_stations(stations):
+    if not isinstance(stations, (list, tuple)):
+        raise ValueError('offset stations must be a nonempty list or tuple')
+    if not stations:
+        raise ValueError('offset stations must be a nonempty list or tuple')
+    names = tuple(require_name(station, 'station') for station in stations)
+    if len(set(names)) != len(names):
+        raise ValueError('duplicate offset station')
+    return tuple(sorted(names))
+
+
+def make_offset_package(package_id, day_id, stations, litres):
+    package_id = _require_offset_id(package_id)
+    day_id = _require_day_id(day_id)
+    names = _normalize_stations(stations)
+    litres = require_integer(litres)
+    if litres <= 0:
+        raise ValueError('offset litres must be a positive integer')
+    return Package(package_id, day_id, 'offset', stations=names, litres=litres)
+
+
 def make_withdrawal_package(package_id, correction: Package):
     if correction.kind != 'correction':
         raise ValueError('withdrawal target must be a correction')
@@ -73,10 +105,15 @@ def encode_package(package: Package):
         data = {'station': package.station, 'delta_litres': litres_text(package.delta)}
         if package.kind == 'withdrawal':
             data['target_id'] = package.target_id
+    elif package.kind == 'offset':
+        data = {
+            'stations': list(package.stations),
+            'litres': litres_text(package.litres),
+        }
     else:
         raise ValueError('unknown package kind')
     return json.dumps({
-        'version': WIRE_VERSION,
+        'version': package.version,
         'id': package.package_id,
         'day_id': package.day_id,
         'kind': package.kind,
@@ -105,12 +142,15 @@ def decode_package(wire):
     except RecursionError as exc:
         raise ValueError('package nesting exceeds JSON decoder capacity') from exc
     require_fields(document, {'version', 'id', 'day_id', 'kind', 'data'}, 'package')
-    if type(document['version']) is not int or document['version'] != WIRE_VERSION:
+    kind = document['kind']
+    if not isinstance(kind, str):
+        raise ValueError('unknown package kind')
+    expected_version = OFFSET_WIRE_VERSION if kind == 'offset' else WIRE_VERSION
+    if type(document['version']) is not int or document['version'] != expected_version:
         raise ValueError('unsupported wire version')
     package_id = require_name(document['id'], 'package id')
     day_id = _require_day_id(document['day_id'])
     data = document['data']
-    kind = document['kind']
     if kind == 'base':
         if package_id != day_id or not isinstance(data, dict):
             raise ValueError('invalid base package identity or snapshot')
@@ -123,4 +163,11 @@ def decode_package(wire):
         return _withdrawal(
             package_id, day_id, data['station'], text_litres(data['delta_litres']), data['target_id']
         )
+    if kind == 'offset':
+        require_fields(data, {'stations', 'litres'}, 'offset')
+        stations = data['stations']
+        if not isinstance(stations, list):
+            raise ValueError('offset stations must be an array')
+        litres = text_litres(data['litres'])
+        return make_offset_package(package_id, day_id, stations, litres)
     raise ValueError('unknown package kind')

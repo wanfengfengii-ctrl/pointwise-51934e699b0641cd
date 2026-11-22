@@ -22,6 +22,14 @@ class JournalEntry:
     delta: int
 
 
+@dataclass(frozen=True)
+class OffsetRecord:
+    sequence: int
+    package_id: str
+    day_id: str
+    by_station: dict
+
+
 class AcceptanceStore:
     def __init__(self, connection):
         self.connection = connection
@@ -50,6 +58,22 @@ class AcceptanceStore:
             self.connection.execute('''
                 CREATE INDEX IF NOT EXISTS journal_day_sequence
                 ON journal_entries (day_id, sequence)
+            ''')
+            self.connection.execute('''
+                CREATE TABLE IF NOT EXISTS offset_orders (
+                    package_id TEXT PRIMARY KEY, day_id TEXT NOT NULL,
+                    stations TEXT NOT NULL, litres TEXT NOT NULL
+                )
+            ''')
+            self.connection.execute('''
+                CREATE TABLE IF NOT EXISTS offset_postings (
+                    sequence INTEGER PRIMARY KEY, package_id TEXT NOT NULL UNIQUE,
+                    day_id TEXT NOT NULL, by_station TEXT NOT NULL
+                )
+            ''')
+            self.connection.execute('''
+                CREATE INDEX IF NOT EXISTS offset_posting_day_sequence
+                ON offset_postings (day_id, sequence)
             ''')
 
     @staticmethod
@@ -121,3 +145,49 @@ class AcceptanceStore:
             VALUES (?, ?, ?, ?, ?)
         ''', (day_id, package_id, correction_id, station, litres_text(delta)))
         return cursor.lastrowid
+
+    def insert_offset_order(self, package_id, day_id, stations, litres):
+        self._require_transaction()
+        self.connection.execute('''
+            INSERT INTO offset_orders (package_id, day_id, stations, litres) VALUES (?, ?, ?, ?)
+        ''', (package_id, day_id, json.dumps(list(stations), ensure_ascii=False), litres_text(litres)))
+
+    def get_offset_order(self, package_id):
+        row = self.connection.execute('''
+            SELECT package_id, day_id, stations, litres FROM offset_orders WHERE package_id = ?
+        ''', (package_id,)).fetchone()
+        return None if row is None else (row[0], row[1], tuple(json.loads(row[2])), text_litres(row[3]))
+
+    def list_offset_orders(self, day_id):
+        rows = self.connection.execute('''
+            SELECT package_id, day_id, stations, litres FROM offset_orders
+            WHERE day_id = ? ORDER BY rowid
+        ''', (day_id,))
+        return tuple((package_id, day, tuple(json.loads(stations)), text_litres(litres))
+                     for package_id, day, stations, litres in rows)
+
+    def insert_offset_posting(self, package_id, day_id, by_station):
+        self._require_transaction()
+        stored = {station: litres_text(value) for station, value in by_station.items()}
+        cursor = self.connection.execute('''
+            INSERT INTO offset_postings (package_id, day_id, by_station) VALUES (?, ?, ?)
+        ''', (package_id, day_id, json.dumps(stored, sort_keys=True, ensure_ascii=False)))
+        return cursor.lastrowid
+
+    def _posting(self, row):
+        sequence, package_id, day_id, by_station = row
+        split = {station: text_litres(value) for station, value in json.loads(by_station).items()}
+        return OffsetRecord(sequence, package_id, day_id, split)
+
+    def get_offset_posting(self, package_id):
+        row = self.connection.execute('''
+            SELECT sequence, package_id, day_id, by_station FROM offset_postings WHERE package_id = ?
+        ''', (package_id,)).fetchone()
+        return None if row is None else self._posting(row)
+
+    def list_offset_postings(self, day_id):
+        rows = self.connection.execute('''
+            SELECT sequence, package_id, day_id, by_station FROM offset_postings
+            WHERE day_id = ? ORDER BY sequence
+        ''', (day_id,))
+        return tuple(self._posting(row) for row in rows)

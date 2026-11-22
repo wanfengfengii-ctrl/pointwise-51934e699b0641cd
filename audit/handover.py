@@ -7,16 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from audit.daybook import Daybook, read
+from audit.daybook import Daybook, read, read_offset
 from audit.receipts import read_receipt
 from freezing.days import freeze
 from freezing.store import FrozenDayStore
 from intake.batches import submit
 from intake.store import BatchStore
 from issue.corrections import amend
-from issue.register import IssueRegister, export
+from issue.register import IssueRegister, export, issue_offset
 from issue.withdrawals import withdraw
-from receive.intake import accept
+from receive.intake import accept, post_offset
 from receive.receipts import AcceptanceReceipt
 from receive.store import AcceptanceStore
 
@@ -178,6 +178,208 @@ def _demo():
         day_id, base, actions, imported = _issue_sample(source_path, sample)
         _run_delivery(early_path, sample, 'v5', day_id, base, actions, imported)
         _run_delivery(late_path, sample, 'v6', day_id, base, actions, imported)
+        _run_offset_demo(root)
+
+
+OFFSET_STATIONS = ('甲', '乙', '丙', '丁')
+OFFSET_DAY = '2026-07-14'
+OFFSET_BATCHES = (
+    ('offset-a', '甲', 5, 'north.csv', 2),
+    ('offset-b', '乙', 5, 'east.csv', 3),
+    ('offset-c', '丙', 5, 'south.csv', 4),
+    ('offset-d', '丁', 5, 'west.csv', 5),
+)
+OFFSET_ORDERS = (
+    ('P', OFFSET_STATIONS, 5),
+    ('Q', ('甲', '乙'), 5),
+    ('R', ('甲', '乙'), 5),
+)
+
+
+def _issue_offset_day(source_path):
+    with closing(sqlite3.connect(source_path)) as source:
+        batches = BatchStore(source)
+        days = FrozenDayStore(source)
+        register = IssueRegister(source)
+        for store in (batches, days, register):
+            store.initialize()
+        for batch_id, station, litres, document, line in OFFSET_BATCHES:
+            submit(batches, batch_id, station, OFFSET_DAY, [
+                {'unit': 'L', 'litres': litres, 'source': {'document': document, 'line': line}}
+            ])
+        day = freeze(batches, days, OFFSET_DAY, [batch[0] for batch in OFFSET_BATCHES])
+        base = export(days, register, day.day_id)
+        orders = {
+            offset_id: issue_offset(days, register, offset_id, day.day_id, stations, litres)
+            for offset_id, stations, litres in OFFSET_ORDERS
+        }
+        return day.day_id, base, orders
+
+
+def _run_offset_demo(root):
+    source_path = root / 'offset-source.sqlite'
+    ledger_path = root / 'offset-ledger.sqlite'
+    _initialize(source_path, ledger_path)
+    day_id, base, orders = _issue_offset_day(source_path)
+    receipts = {}
+    balances = []
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        ledger = AcceptanceStore(connection)
+        accept(ledger, base)
+        for offset_id in ('P', 'Q', 'R'):
+            receipts[offset_id] = accept(ledger, orders[offset_id])
+            balances.append(read(ledger, day_id=day_id).totals.current_litres)
+        posting = post_offset(ledger, 'P')
+        after_p = read(ledger, day_id=day_id)
+        touched = next(iter(posting.by_station))
+        residual = 5 - posting.by_station[touched]
+    # The source register is the authority for issuing the two dedicated orders.
+    with closing(sqlite3.connect(source_path)) as source:
+        days = FrozenDayStore(source)
+        register = IssueRegister(source)
+        rejected = issue_offset(days, register, 'X', day_id, (touched,), 5)
+        accepted = issue_offset(days, register, 'Y', day_id, (touched,), residual)
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        ledger = AcceptanceStore(connection)
+        try:
+            accept(ledger, rejected)
+            rejected_ok = False
+        except ValueError as exc:
+            rejected_ok = 'jointly fulfilled' in str(exc)
+        accepted_ok = accept(ledger, accepted).outcome
+        postings = {}
+        for offset_id in ('Q', 'R'):
+            postings[offset_id] = post_offset(ledger, offset_id)
+        final = read(ledger, day_id=day_id)
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        reopened = read_offset(AcceptanceStore(connection), 'P')
+    _report_offset_scenario(
+        day_id, receipts, balances, posting, after_p, postings, final, rejected_ok, accepted_ok,
+        residual, reopened,
+    )
+    _run_multi_station_demo(root, source_path, day_id)
+
+
+def _run_multi_station_demo(root, source_path, day_id):
+    """7 L over 丙丁, a failing commit checkpoint, reopen and a lost reply."""
+    ledger_path = root / 'offset-seven.sqlite'
+    _initialize(source_path, ledger_path)
+    with closing(sqlite3.connect(source_path)) as source:
+        days = FrozenDayStore(source)
+        register = IssueRegister(source)
+        seven = issue_offset(days, register, 'S', day_id, ('丙', '丁'), 7)
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        ledger = AcceptanceStore(connection)
+        with closing(sqlite3.connect(root / 'offset-source.sqlite')) as base_source:
+            base = export(FrozenDayStore(base_source), IssueRegister(base_source), day_id)
+        accept(ledger, base)
+        receipt = accept(ledger, seven)
+        observed = []
+
+        def fail(result):
+            observed.append(result)
+            if read(ledger, day_id=day_id).totals.current_litres != 13:
+                raise AssertionError('pending posting not visible inside the callback')
+            raise RuntimeError('lost reply')
+
+        try:
+            post_offset(ledger, 'S', before_commit=fail)
+            rolled_back = False
+        except RuntimeError as exc:
+            rolled_back = str(exc) == 'lost reply'
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        ledger = AcceptanceStore(connection)
+        after_failure = read(ledger, day_id=day_id)
+        preserved = read_offset(ledger, 'S')
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        ledger = AcceptanceStore(connection)
+        result = post_offset(ledger, 'S')
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        ledger = AcceptanceStore(connection)
+        reopened = read_offset(ledger, 'S')
+        replayed = post_offset(ledger, 'S')
+        final = read(ledger, day_id=day_id)
+    if not rolled_back:
+        raise AssertionError('failed commit checkpoint did not propagate')
+    if after_failure.totals.current_litres != 20 or preserved[1] is not None:
+        raise AssertionError('failed posting was not fully rolled back')
+    if preserved[0] != receipt:
+        raise AssertionError('first acceptance receipt was not preserved after rollback')
+    if sum(result.by_station.values()) != 7 or set(result.by_station) - {'丙', '丁'}:
+        raise AssertionError(f'7 L split is not confined to 丙丁: {result.by_station}')
+    if final.totals.current_litres != 13:
+        raise AssertionError(f'7 L posting did not leave 13 L: {final.totals.current_litres}')
+    if reopened != (receipt, result) or replayed != result:
+        raise AssertionError('reopened or replayed S did not return the first posting')
+    if len(observed) != 1:
+        raise AssertionError('the commit checkpoint did not receive exactly one result')
+    print('POINTWISE_SCENARIO ' + json.dumps({
+        'case_id': 'offset-multi',
+        'input': {'order': ['S', ['丙', '丁'], 7]},
+        'expected': {'initial_litres': 20, 'after_failure': 20, 'after_retry': 13,
+                     'split_total': 7},
+        'actual': {'initial_litres': after_failure.totals.current_litres,
+                   'after_retry': final.totals.current_litres, 'split': result.by_station,
+                   'split_total': sum(result.by_station.values())},
+        'downstream_expected': {'rollback_propagated': True, 'receipt_preserved': True,
+                                'reopened_split': 'first posting', 'replayed_same': True},
+        'downstream_actual': {'rollback_propagated': rolled_back,
+                              'receipt_preserved': preserved[0] == receipt,
+                              'reopened_split': reopened[1].by_station if reopened[1] else None,
+                              'replayed_same': replayed == result},
+        'code_paths': ['receive/intake.py', 'receive/offsets.py', 'receive/store.py',
+                       'audit/daybook.py', 'audit/handover.py'],
+        'oracle': '丙丁各 5 L，7 L 单须跨两站整数拆扣；回调失败回滚为 20 L，'
+                  '重试后为 13 L，重开按号可查回原分摊。',
+    }, ensure_ascii=False, sort_keys=True))
+
+
+def _report_offset_scenario(day_id, receipts, balances, posting, after_p, postings, final,
+                            rejected_ok, accepted_ok, residual, reopened):
+    expected_balance_snapshot = (20, 20, 20)
+    if tuple(balances) != expected_balance_snapshot:
+        raise AssertionError(f'offset accept changed the balance: {balances}')
+    if not (set(posting.by_station) <= {'丙', '丁'} and sum(posting.by_station.values()) == 5):
+        raise AssertionError(f'P split is not confined to 丙丁: {posting.by_station}')
+    if after_p.totals.current_litres != 15:
+        raise AssertionError(f'P did not deduct 5 L: {after_p.totals.current_litres}')
+    final_by_station = {station: value.current_litres
+                        for station, value in final.totals.by_station.items()}
+    if (final_by_station['甲'], final_by_station['乙']) != (0, 0):
+        raise AssertionError(f'甲乙 residual is not zero: {final_by_station}')
+    if final_by_station['丙'] + final_by_station['丁'] != 5:
+        raise AssertionError(f'丙丁 residual is not 5 L: {final_by_station}')
+    if final.totals.current_litres != 5:
+        raise AssertionError(f'day total is not 5 L: {final.totals.current_litres}')
+    if not rejected_ok:
+        raise AssertionError('an over-committed dedicated station order was accepted')
+    if accepted_ok != 'offset_pending':
+        raise AssertionError(f'residual dedicated order was rejected: {accepted_ok}')
+    if reopened != (receipts['P'], posting):
+        raise AssertionError(f'reopened P does not preserve the first posting: {reopened}')
+    print('POINTWISE_SCENARIO ' + json.dumps({
+        'case_id': 'offset',
+        'input': {'orders': [list(order) for order in OFFSET_ORDERS],
+                  'post_order': ['P', 'Q', 'R']},
+        'expected': {'accept_balances': list(expected_balance_snapshot),
+                     'P_split': '丙丁合计 5 L', 'final': {'甲': 0, '乙': 0, '丙丁': 5}},
+        'actual': {'accept_balances': list(balances), 'P_split': posting.by_station,
+                   'P_current': after_p.totals.current_litres,
+                   'final_by_station': final_by_station,
+                   'final_total': final.totals.current_litres},
+        'downstream_expected': {'dedicated_5L_rejected': True,
+                                'residual_dedicated_accepted': True,
+                                'reopened_P': '首执与实际分摊不变'},
+        'downstream_actual': {'dedicated_5L_rejected': rejected_ok,
+                              'residual_dedicated_accepted': accepted_ok == 'offset_pending',
+                              'residual_litres': residual,
+                              'reopened_P': [reopened[0].outcome, reopened[1].by_station]},
+        'code_paths': ['issue/register.py', 'issue/packages.py', 'receive/intake.py',
+                       'receive/offsets.py', 'receive/store.py', 'audit/daybook.py',
+                       'audit/reconcile.py', 'audit/handover.py'],
+        'oracle': '四站各 5 L。P 先只扣丙丁合计 5 L；Q、R 扣尽甲乙。'
+                  '已过账的 P 分摊固定，重开按号仍可查回。',
+    }, ensure_ascii=False, sort_keys=True))
 
 
 def _verify():

@@ -1,10 +1,11 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from freezing.history import load_frozen_day
+from freezing.history import load_frozen_day, require_frozen_station
 from freezing.store import FrozenDayStore
 from intake.provenance import require_name
-from issue.packages import Package, decode_package, encode_package, make_base_package
+from issue.packages import (Package, decode_package, encode_package, make_base_package,
+                            make_offset_package)
 
 
 @dataclass(frozen=True)
@@ -69,3 +70,19 @@ def export(days: FrozenDayStore, register: IssueRegister, package_id) -> str:
         if day is None:
             raise LookupError(f'package not found: {package_id}')
         return register.save(make_base_package(day)).wire
+
+
+def issue_offset(days: FrozenDayStore, register: IssueRegister, offset_id, day_id, stations, litres) -> str:
+    with register.transaction():
+        package = make_offset_package(offset_id, day_id, stations, litres)
+        original = register.find(package.package_id)
+        if original is not None:
+            if original.package != package:
+                raise ValueError(f'conflicting issue: {package.package_id}')
+            return original.wire
+        day = load_frozen_day(days, package.day_id)
+        if day is None:
+            raise LookupError(f'frozen day not found: {package.day_id}')
+        for station in package.stations:
+            require_frozen_station(day, station)
+        return register.save(package).wire

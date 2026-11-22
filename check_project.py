@@ -3,6 +3,23 @@ import sys
 import unittest
 
 
+def _run_fixture_checks():
+    """Exercise the four-station offset fixture end to end.
+
+    Returns ``True`` when every assertion holds; any failure prints and returns
+    ``False`` so the caller can exit non-zero.
+    """
+    try:
+        import offset_fixture
+        offset_fixture.check_base()
+        offset_fixture.check_offsets()
+    except Exception as exc:  # noqa: BLE001 - surface any fixture failure as a check failure
+        print(f'FIXTURE FAIL {type(exc).__name__}: {exc}', file=sys.stderr)
+        return False
+    print('FIXTURE SUMMARY result=PASS')
+    return True
+
+
 def main():
     suite = unittest.defaultTestLoader.discover('tests', top_level_dir='.')
     if suite.countTestCases():
@@ -23,6 +40,7 @@ def main():
           f'expected_failures={len(result.expectedFailures)} '
           f'unexpected_successes={len(result.unexpectedSuccesses)} '
           f'result={"PASS" if successful else "FAIL"}')
+    successful = _run_fixture_checks() and successful
     return 0 if successful else 1
 
 

@@ -16,7 +16,7 @@ def acceptance_transaction(store: AcceptanceStore):
 
 def publish_acceptance(
     store: AcceptanceStore, package, wire, decision: SettlementDecision,
-    base: FrozenDay | None = None, before_commit=None,
+    base: FrozenDay | None = None, before_commit=None, offset_order=None,
 ):
     if base is not None:
         store.insert_base(base.day_id, base.to_payload())
@@ -25,6 +25,9 @@ def publish_acceptance(
         sequence = store.append_journal(
             package.day_id, package.package_id, decision.correction_id, package.station, decision.delta
         )
+    if offset_order is not None:
+        stations, litres = offset_order
+        store.insert_offset_order(package.package_id, package.day_id, stations, litres)
     receipt = make_acceptance_receipt(package, decision.outcome, decision.correction_id, sequence)
     store.insert_acceptance(AcceptanceRecord(package.package_id, wire, package.target_id, asdict(receipt)))
     if before_commit is not None:
